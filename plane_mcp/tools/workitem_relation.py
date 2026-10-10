@@ -3,6 +3,10 @@
 Two systems behind one tool: built-in dependencies (six fixed directional types)
 and custom relations (workspace-defined, each with an outward and inward label).
 `create` routes between them by which arguments are supplied.
+
+Plane Community Edition serves none of those endpoints, only the older
+`/work-items/<id>/relations/` (GET and POST, no delete). A 404 from the
+current endpoints falls back to it, or says what CE cannot do.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Literal, get_args
 
 from fastmcp import FastMCP
+from plane.errors.errors import HttpError
 from plane.models.work_item_relation_definitions import (
     CreateWorkItemRelationDefinition,
     PaginatedWorkItemRelationDefinitionResponse,
@@ -19,6 +24,7 @@ from plane.models.work_item_relation_definitions import (
 from plane.models.work_items import (
     CreateWorkItemCustomRelation,
     CreateWorkItemDependency,
+    CreateWorkItemRelation,
     DependencyTypeEnum,
 )
 
@@ -38,6 +44,16 @@ NAME = "workitem_relation"
 TITLE = "Work item relations"
 
 DEPENDENCY_TYPES: tuple[str, ...] = get_args(DependencyTypeEnum)
+# Built in on Community Edition, where custom relation definitions do not exist.
+CE_ONLY_TYPES: tuple[str, ...] = ("relates_to", "duplicate")
+
+_CE_NO_CUSTOM = (
+    "Error: this Plane is Community Edition, which has no custom relations. Use relation_type "
+    f"({', '.join(DEPENDENCY_TYPES + CE_ONLY_TYPES)})."
+)
+_CE_NO_DELETE = (
+    "Error: this Plane is Community Edition, whose API cannot delete relations. Remove it in the web UI."
+)
 
 _OTHER_RELATIONS = (
     "For any other relationship pass relation_definition_id and "
@@ -102,6 +118,24 @@ def _all_definitions(client, workspace_slug: str, is_default, is_active) -> list
             return results
 
 
+def _absent(exc: HttpError) -> bool:
+    """The endpoint is missing, as on Community Edition."""
+    return exc.status_code == 404
+
+
+def _ce_relations_path(workspace_slug: str, project_id: str, workitem_id: str) -> str:
+    return f"{workspace_slug}/projects/{project_id}/work-items/{workitem_id}/relations"
+
+
+def _ce_create(client, workspace_slug: str, project_id: str, workitem_id: str, relation_type: str, targets):
+    return client.work_items.relations.create(
+        workspace_slug=workspace_slug,
+        project_id=project_id,
+        work_item_id=workitem_id,
+        data=CreateWorkItemRelation(relation_type=relation_type, issues=targets),  # type: ignore[arg-type]
+    )
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name=NAME,
@@ -140,12 +174,13 @@ def register(mcp: FastMCP) -> None:
         client, workspace_slug = get_plane_client_context()
 
         if action == "list_definitions":
-            return {
-                "built_in_dependencies": list(DEPENDENCY_TYPES),
-                "custom_definitions": [
-                    d.model_dump() for d in _all_definitions(client, workspace_slug, is_default, is_active)
-                ],
-            }
+            try:
+                custom = [d.model_dump() for d in _all_definitions(client, workspace_slug, is_default, is_active)]
+            except HttpError as exc:
+                if not _absent(exc):
+                    raise
+                return {"built_in_dependencies": list(DEPENDENCY_TYPES + CE_ONLY_TYPES), "custom_definitions": []}
+            return {"built_in_dependencies": list(DEPENDENCY_TYPES), "custom_definitions": custom}
 
         if action == "create_definition":
             if not name:
@@ -183,9 +218,20 @@ def register(mcp: FastMCP) -> None:
             return error
 
         if action == "list":
-            dependencies = client.work_items.dependencies.list(
-                workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
-            )
+            try:
+                dependencies = client.work_items.dependencies.list(
+                    workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                )
+            except HttpError as exc:
+                if not _absent(exc):
+                    raise
+                # The SDK's relations.list types each entry as a bare id, but CE returns
+                # {project_id, issue_id} objects, so the response is read unvalidated.
+                return {
+                    "relations": client.work_items.relations._get(
+                        endpoint=_ce_relations_path(workspace_slug, project_id, workitem_id)
+                    )
+                }
             custom = client.work_items.custom_relations.list(
                 workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
             )
@@ -199,28 +245,41 @@ def register(mcp: FastMCP) -> None:
             if not targets:
                 return missing(action, "workitem_ids")
             if relation_type:
-                if error := one_of("relation_type", relation_type, DEPENDENCY_TYPES, _OTHER_RELATIONS):
+                allowed = DEPENDENCY_TYPES + CE_ONLY_TYPES
+                if error := one_of("relation_type", relation_type, allowed, _OTHER_RELATIONS):
                     return error
-                return client.work_items.dependencies.create(
-                    workspace_slug=workspace_slug,
-                    project_id=project_id,
-                    work_item_id=workitem_id,
-                    data=CreateWorkItemDependency(
-                        relation_type=relation_type,  # type: ignore[arg-type]
-                        work_item_ids=targets,
-                    ),
-                )
+                if relation_type in CE_ONLY_TYPES:
+                    return _ce_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
+                try:
+                    return client.work_items.dependencies.create(
+                        workspace_slug=workspace_slug,
+                        project_id=project_id,
+                        work_item_id=workitem_id,
+                        data=CreateWorkItemDependency(
+                            relation_type=relation_type,  # type: ignore[arg-type]
+                            work_item_ids=targets,
+                        ),
+                    )
+                except HttpError as exc:
+                    if not _absent(exc):
+                        raise
+                    return _ce_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
             if relation_definition_id and relation_definition_label:
-                return client.work_items.custom_relations.create(
-                    workspace_slug=workspace_slug,
-                    project_id=project_id,
-                    work_item_id=workitem_id,
-                    data=CreateWorkItemCustomRelation(
-                        relation_definition_id=relation_definition_id,
-                        relation_definition_type=relation_definition_label,
-                        work_item_ids=targets,
-                    ),
-                )
+                try:
+                    return client.work_items.custom_relations.create(
+                        workspace_slug=workspace_slug,
+                        project_id=project_id,
+                        work_item_id=workitem_id,
+                        data=CreateWorkItemCustomRelation(
+                            relation_definition_id=relation_definition_id,
+                            relation_definition_type=relation_definition_label,
+                            work_item_ids=targets,
+                        ),
+                    )
+                except HttpError as exc:
+                    if not _absent(exc):
+                        raise
+                    return _CE_NO_CUSTOM
             return (
                 "Error: provide relation_type for a built-in dependency, or both "
                 "relation_definition_id and relation_definition_label for a custom relation. "
@@ -230,10 +289,15 @@ def register(mcp: FastMCP) -> None:
         if not related_workitem_id:
             return missing(action, "related_workitem_id")
         remove = client.work_items.dependencies.remove if is_dependency else client.work_items.custom_relations.remove
-        remove(
-            workspace_slug=workspace_slug,
-            project_id=project_id,
-            work_item_id=workitem_id,
-            related_work_item_id=related_workitem_id,
-        )
+        try:
+            remove(
+                workspace_slug=workspace_slug,
+                project_id=project_id,
+                work_item_id=workitem_id,
+                related_work_item_id=related_workitem_id,
+            )
+        except HttpError as exc:
+            if not _absent(exc):
+                raise
+            return _CE_NO_DELETE
         return None
