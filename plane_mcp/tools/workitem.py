@@ -35,6 +35,7 @@ from plane_mcp.toolkit import (
     build_annotations,
     build_description,
     coerce_list,
+    community,
     envelope,
     ids_of,
     missing,
@@ -303,6 +304,21 @@ def register(mcp: FastMCP) -> None:
                 else:
                     response = client.work_items.list_workspace(workspace_slug=workspace_slug, params=params)
             except HttpError as exc:
+                if (pql and community.rejects_filters(exc)) or (not project_id and community.not_found(exc)):
+                    return community.list_work_items(
+                        client,
+                        workspace_slug,
+                        tool=NAME,
+                        action=action,
+                        project_id=project_id,
+                        archived=action == "list_archived",
+                        pql=pql,
+                        order_by=order_by,
+                        cursor=cursor,
+                        per_page=per_page,
+                        expand=expand,
+                        fields=fields,
+                    )
                 failure = pql_failure("workitem", action, pql, exc)
                 if failure:
                     return failure
@@ -319,6 +335,17 @@ def register(mcp: FastMCP) -> None:
                     ),
                 )
             except HttpError as exc:
+                if community.not_found(exc) or community.rejects_filters(exc):
+                    return community.count_work_items(
+                        client,
+                        workspace_slug,
+                        tool=NAME,
+                        action=action,
+                        project_id=project_id,
+                        pql=pql,
+                        group_by=group_by,
+                        sub_group_by=sub_group_by,
+                    )
                 failure = pql_failure("workitem", action, scoped, exc)
                 if failure:
                     return failure

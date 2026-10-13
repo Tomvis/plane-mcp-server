@@ -17,6 +17,7 @@ from plane.errors.errors import HttpError
 from plane.models.query_params import WorkItemQueryParams
 
 from plane_mcp.pql_reference import PQL_FULL_REFERENCE
+from plane_mcp.toolkit import community
 from plane_mcp.toolkit.runtime import opt
 
 logger = get_logger(__name__)
@@ -87,9 +88,14 @@ def workitem_page(
     per_page: int = 0,
     expand: str = "",
     fields: str = "",
+    client: Any = None,
     **target: Any,
 ) -> dict[str, Any]:
-    """One page of the work items belonging to a parent record."""
+    """One page of the work items belonging to a parent record.
+
+    `client` enables the Community Edition fallback for `pql`; without it the
+    400 is reported as before.
+    """
     try:
         response = method(
             **target,
@@ -103,6 +109,21 @@ def workitem_page(
             ),
         )
     except HttpError as exc:
+        if pql and client is not None and community.rejects_filters(exc):
+            return community.filter_page(
+                client,
+                target["workspace_slug"],
+                method,
+                tool=tool,
+                action=action,
+                pql=pql,
+                order_by=order_by,
+                cursor=cursor,
+                per_page=per_page,
+                expand=expand,
+                fields=fields,
+                **target,
+            )
         failure = pql_failure(tool, action, pql, exc)
         if failure is None:
             raise

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
 from fastmcp import FastMCP
+from plane.errors.errors import HttpError
 from plane.models.enums import CatalogGroupEnum, GroupEnum
 from plane.models.states import (
     CreateState,
@@ -21,6 +22,7 @@ from plane_mcp.toolkit import (
     Action,
     build_annotations,
     build_description,
+    community,
     envelope,
     missing,
     needs,
@@ -150,9 +152,14 @@ def register(mcp: FastMCP) -> None:
             return model(**{k: v for k, v in fields.items() if v is not None and k in model.model_fields})
 
         if action == "list":
-            response: PaginatedStateResponse = scope.namespace.list(
-                workspace_slug=workspace_slug, **scope.kwargs, params=page_params(cursor, per_page)
-            )
+            try:
+                response: PaginatedStateResponse = scope.namespace.list(
+                    workspace_slug=workspace_slug, **scope.kwargs, params=page_params(cursor, per_page)
+                )
+            except HttpError as exc:
+                if project_id or not community.not_found(exc):
+                    raise
+                return community.workspace_states(client, workspace_slug, cursor, per_page)
             return envelope(response)
 
         if action == "create":

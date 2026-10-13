@@ -203,6 +203,7 @@ def register(mcp: FastMCP) -> None:
                 NAME,
                 action,
                 client.modules.list_work_items,
+                client=client,
                 pql=pql,
                 order_by=order_by,
                 cursor=cursor,
