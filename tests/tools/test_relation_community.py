@@ -3,7 +3,9 @@
 CE v1.4.x serves neither `/dependencies/`, `/custom-relations/` nor
 `/work-item-relation-definitions/`; every call 404s. It does serve the older
 `/work-items/<id>/relations/` (GET + POST, no delete). On a 404 the tool falls
-back to that endpoint, or says plainly what CE cannot do.
+back to that endpoint, or says plainly what CE cannot do. Delete uses
+`/relations/remove/`, which only the homelab overlay on Plane's API adds
+(Tomvis/homelab-stacks hosts/101/plane/api-overlay).
 """
 
 from __future__ import annotations
@@ -93,7 +95,9 @@ def test_custom_relation_on_ce_is_refused_with_a_reason(registered, ce):
 
 
 @pytest.mark.parametrize("is_dependency", [True, False])
-def test_delete_on_ce_is_refused_with_a_reason(registered, ce, is_dependency):
+def test_delete_on_ce_falls_back_to_the_overlay_remove_endpoint(registered, ce, is_dependency):
+    ce.returns["work_items.relations._post"] = None
+
     result = _call(
         registered,
         action="delete",
@@ -103,8 +107,30 @@ def test_delete_on_ce_is_refused_with_a_reason(registered, ce, is_dependency):
         is_dependency=is_dependency,
     )
 
+    assert result is None
+    post = ce.recorder.calls[-1]
+    assert post.method == "work_items.relations._post"
+    assert post.kwargs["endpoint"] == "acme/projects/p/work-items/w/relations/remove"
+    assert post.kwargs["data"] == {"related_issue": "w-2"}
+
+
+def test_delete_on_ce_without_the_overlay_is_refused_with_a_reason(registered, ce):
+    ce.returns["work_items.relations._post"] = NOT_FOUND
+
+    result = _call(registered, action="delete", project_id="p", workitem_id="w", related_workitem_id="w-2")
+
     assert isinstance(result, str) and result.startswith("Error:")
     assert "web UI" in result
+
+
+def test_delete_on_ce_of_a_missing_relation_says_so(registered, ce):
+    ce.returns["work_items.relations._post"] = HttpError(
+        "Not Found", status_code=404, response={"error": "relation not found"}
+    )
+
+    result = _call(registered, action="delete", project_id="p", workitem_id="w", related_workitem_id="w-2")
+
+    assert result == "Error: no relation between w and w-2."
 
 
 def test_list_definitions_on_ce_lists_the_built_in_types(registered, ce):

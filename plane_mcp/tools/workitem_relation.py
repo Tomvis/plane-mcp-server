@@ -6,7 +6,9 @@ and custom relations (workspace-defined, each with an outward and inward label).
 
 Plane Community Edition serves none of those endpoints, only the older
 `/work-items/<id>/relations/` (GET and POST, no delete). A 404 from the
-current endpoints falls back to it, or says what CE cannot do.
+current endpoints falls back to it, or says what CE cannot do. Delete falls
+back to `/relations/remove/`, which stock CE lacks; the homelab overlay on
+Plane's API adds it (Tomvis/homelab-stacks hosts/101/plane/api-overlay).
 """
 
 from __future__ import annotations
@@ -52,7 +54,8 @@ _CE_NO_CUSTOM = (
     f"({', '.join(DEPENDENCY_TYPES + CE_ONLY_TYPES)})."
 )
 _CE_NO_DELETE = (
-    "Error: this Plane is Community Edition, whose API cannot delete relations. Remove it in the web UI."
+    "Error: this Plane is Community Edition without the relations/remove overlay, so its API cannot "
+    "delete relations. Remove it in the web UI."
 )
 
 _OTHER_RELATIONS = (
@@ -134,6 +137,22 @@ def _ce_create(client, workspace_slug: str, project_id: str, workitem_id: str, r
         work_item_id=workitem_id,
         data=CreateWorkItemRelation(relation_type=relation_type, issues=targets),  # type: ignore[arg-type]
     )
+
+
+def _ce_remove(client, workspace_slug: str, project_id: str, workitem_id: str, related: str):
+    """CE relations are one table whatever their type, so is_dependency does not matter here."""
+    try:
+        client.work_items.relations._post(
+            endpoint=f"{_ce_relations_path(workspace_slug, project_id, workitem_id)}/remove",
+            data={"related_issue": related},
+        )
+    except HttpError as exc:
+        if not _absent(exc):
+            raise
+        if isinstance(exc.response, dict) and exc.response.get("error") == "relation not found":
+            return f"Error: no relation between {workitem_id} and {related}."
+        return _CE_NO_DELETE
+    return None
 
 
 def register(mcp: FastMCP) -> None:
@@ -299,5 +318,5 @@ def register(mcp: FastMCP) -> None:
         except HttpError as exc:
             if not _absent(exc):
                 raise
-            return _CE_NO_DELETE
+            return _ce_remove(client, workspace_slug, project_id, workitem_id, related_workitem_id)
         return None
