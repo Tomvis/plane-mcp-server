@@ -7,7 +7,7 @@ work items, cycles, modules, releases, customers and more.
 Built on [FastMCP](https://github.com/jlowin/fastmcp) and the official
 [`plane-sdk`](https://pypi.org/project/plane-sdk/).
 
-- **30 tools**, one per Plane resource, covering 207 operations
+- **33 tools**, one per Plane resource, covering 233 operations
 - **Local or remote** — stdio, streamable HTTP, SSE
 - **OAuth or API key** authentication
 
@@ -32,7 +32,7 @@ Add this to your MCP client's configuration:
 }
 ```
 
-`uvx` needs no install step. Requires Python 3.10+.
+`uvx` needs no install step. Requires Python 3.11+.
 
 For a self-hosted Plane, add `"PLANE_BASE_URL": "https://plane.example.com"`.
 
@@ -98,7 +98,7 @@ HTTP transport instead.
 
 ## Tools
 
-The server advertises 30 tools, one per resource. Each takes an `action`
+The server advertises 33 tools, one per resource. Each takes an `action`
 parameter that selects the operation:
 
 ```python

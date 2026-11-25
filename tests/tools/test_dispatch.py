@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 from plane_mcp.toolkit.spec import action_names
 
@@ -27,13 +28,16 @@ SAMPLES: dict[str, object] = {
     "relation_type": "blocked_by",
     "property_type": "TEXT",
     # page and project take the numeric level; collection names it.
-    "access": {"page": 1, "project": 1, "collection": "private"},
+    "access": {"page": 1, "project": 1, "collection": "private", "dashboard": "private"},
     "member_access": "edit",
+    "role_slug": {"member": "contributor"},
     "network": 2,
     "timezone": "UTC",
     "workitem_identifier": "ENG-42",
     "kind": "workitem",
     "template_data": '{"name": "Spec"}',
+    "chart_type": "BAR_CHART",
+    "chart_model": "BASIC",
 }
 
 # Actions that require *one of* several optional parameters -- a condition the
@@ -64,6 +68,10 @@ CONDITIONAL: dict[tuple[str, str], dict[str, object]] = {
     ("release", "update_changelog"): {"description_html": "<p>notes</p>"},
     ("release", "manage_workitems"): {"add_ids": "id-1"},
     ("release_label", "list"): {},
+    ("dashboard", "update"): {"name": "Renamed"},
+    ("dashboard", "update_widget"): {"name": "Renamed"},
+    ("workitem_subscriber", "list"): {"workitem_identifier": "ENG-42"},
+    ("workitem_subscriber", "manage"): {"workitem_identifier": "ENG-42", "add_user_id": "id-1"},
 }
 
 # Actions whose guard clause legitimately answers without calling the SDK.
@@ -73,11 +81,12 @@ NO_CALL_EXPECTED: set[tuple[str, str]] = {
 }
 
 # Actions that need populated remote state or an outbound HTTP fetch to get past
-# their own preconditions. Covered by tests/tools/test_attachments.py.
+# their own preconditions. Covered by tests/tools/test_attachments.py and test_description_image.py.
 NEEDS_FIXTURE: set[tuple[str, str]] = {
     ("workitem_attachment", "read"),
     ("workitem_attachment", "download_url"),
     ("workitem_attachment", "upload_from_url"),
+    ("workitem", "read_description_image"),  # needs an image in the description and an outbound fetch
 }
 
 
@@ -230,10 +239,14 @@ def test_action_literal_covers_every_declared_action(mod, action, registered):
 )
 def test_an_unrecognised_workitem_value_is_refused_not_dropped(args, named, registered, spy):
     """Dropping it created the item minus the field and reported success."""
-    result = registered["workitem"].fn(**args)
-
-    assert isinstance(result, str) and result.startswith("Error:"), result
-    assert named in result, result
+    if named in ("group_by", "sub_group_by"):
+        with pytest.raises(ToolError) as exc_info:
+            registered["workitem"].fn(**args)
+        assert named in str(exc_info.value)
+    else:
+        result = registered["workitem"].fn(**args)
+        assert isinstance(result, str) and result.startswith("Error:"), result
+        assert named in result, result
     assert not spy.recorder.calls, f"reached the SDK with an invalid {named}"
 
 
@@ -277,6 +290,36 @@ def test_archive_does_not_edit_a_cycle_completed_today(registered, spy):
 
     assert "cycles.update" not in spy.recorder.methods, "edited a cycle the API had already closed"
     assert "cycles.archive" in spy.recorder.methods
+
+
+@pytest.mark.parametrize(
+    ("end_date", "running"),
+    [
+        ("2026-10-30T23:00:00+00:00", True),  # later today
+        ("2026-10-30T23:00:00-08:00", True),  # today locally, tomorrow in UTC
+        ("2026-10-30T01:00:00+00:00", False),  # earlier today
+        ("2026-10-30T07:00:00+05:30", False),  # earlier today, other offset
+        ("2026-10-31T00:00:00+00:00", True),  # tomorrow
+        ("2026-10-29T23:00:00+00:00", False),  # yesterday
+        ("2026-10-30", False),  # date only: midnight UTC, already past
+        ("2026-10-30T23:00:00", True),  # no offset: read as UTC
+        (None, True),  # open-ended
+    ],
+)
+def test_still_running_compares_instants_not_dates(end_date, running, monkeypatch):
+    """A cycle ending at 23:00 today is still running at 02:00; Plane will not archive it until it ends."""
+    import datetime as dt
+
+    from plane_mcp.tools import cycle
+
+    class FrozenDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return dt.datetime(2026, 10, 30, 2, 0, tzinfo=dt.timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(cycle, "datetime", FrozenDatetime)
+
+    assert cycle._still_running(end_date) is running
 
 
 @pytest.mark.parametrize("field", ["assignee", "label"])
@@ -440,11 +483,27 @@ def _update_sent(spy):
     return spy.recorder.only().kwargs["data"].model_dump(exclude_unset=True)
 
 
-@pytest.mark.parametrize("field", ["start_date", "target_date"])
-def test_a_date_set_to_null_is_cleared(field, registered, spy):
+@pytest.mark.parametrize("field", ["start_date", "target_date", "parent"])
+def test_a_field_set_to_null_is_cleared(field, registered, spy):
     registered["workitem"].fn(action="update", project_id="p", workitem_id="w", **{field: None})
 
     assert _update_sent(spy) == {field: None}
+
+
+@pytest.mark.parametrize("spelled", ["null", "NULL", "None", " null "])
+@pytest.mark.parametrize("field", ["start_date", "target_date", "parent"])
+def test_a_null_sent_as_text_is_cleared(field, spelled, registered, spy):
+    """A client that stringifies every argument sends "null". Forwarded as text it
+    fails Plane's UUID/date check and nothing is cleared (PAI-2135)."""
+    registered["workitem"].fn(action="update", project_id="p", workitem_id="w", **{field: spelled})
+
+    assert _update_sent(spy) == {field: None}
+
+
+def test_setting_a_parent_still_sends_its_id(registered, spy):
+    registered["workitem"].fn(action="update", project_id="p", workitem_id="w", parent="uuid-1")
+
+    assert _update_sent(spy) == {"parent": "uuid-1"}
 
 
 def test_an_update_sends_only_what_it_was_given(registered, spy):
@@ -462,6 +521,12 @@ def test_clearing_one_date_leaves_the_other_alone(registered, spy):
     )
 
     assert _update_sent(spy) == {"start_date": "2026-01-01", "target_date": None}
+
+
+def test_a_parent_left_at_its_default_is_not_sent(registered, spy):
+    registered["workitem"].fn(action="update", project_id="p", workitem_id="w", name="x", parent="")
+
+    assert "parent" not in _update_sent(spy)
 
 
 def test_a_date_left_at_its_default_is_not_sent(registered, spy):
@@ -482,9 +547,10 @@ def test_argument_repair_keeps_the_default_distinct_from_null(sent, arrives, reg
     would arrive as null and clear the date."""
     from plane_mcp.coercion import coerce_arguments
 
-    repaired, _ = coerce_arguments({"target_date": sent}, registered["workitem"].parameters)
+    for field in ("target_date", "parent"):
+        repaired, _ = coerce_arguments({field: sent}, registered["workitem"].parameters)
 
-    assert repaired["target_date"] == arrives
+        assert repaired[field] == arrives
 
 
 def test_retrieving_the_workspace_asks_plane_nothing(registered, spy, monkeypatch):
@@ -514,3 +580,31 @@ def test_no_description_warns_about_a_failure_the_caller_cannot_avoid(resource_m
         if phrase in registered[mod.NAME].description.lower()
     ]
     assert not offenders, f"descriptions predicting a refusal instead of letting the API report it: {offenders}"
+
+
+@pytest.mark.parametrize(
+    ("pql", "sent"),
+    [(None, {"stripped": ""}), ("", None), ('priority = "high"', {"stripped": 'priority = "high"'})],
+)
+def test_a_view_query_set_to_null_is_cleared(pql, sent, registered, spy):
+    """Plane switches a view back to its rich filters when its query is empty."""
+    registered["view"].fn(action="update", view_id="v", name="Renamed", pql=pql)
+
+    assert spy.recorder.only().kwargs["data"].pql_filters == sent
+
+
+def test_the_project_roster_leaves_out_removed_members(registered, spy):
+    """remove_from_project keeps an inactive row, so an unfiltered list would still show the person."""
+    registered["member"].fn(action="list_project", project_id="p-1")
+
+    call = spy.recorder.calls[-1]
+    assert call.method == "projects.get_members"
+    assert call.kwargs["params"].is_active is True
+
+
+@pytest.mark.parametrize("role", ["commenter", "qa-lead"])
+def test_any_project_role_slug_reaches_plane(role, registered, spy):
+    """Commenter and custom project roles are Plane's to accept or refuse, not the tool's."""
+    registered["member"].fn(action="add_to_project", project_id="p-1", user_id="u-1", role_slug=role)
+
+    assert spy.recorder.calls[-1].kwargs["data"].role == role
